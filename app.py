@@ -250,9 +250,9 @@ class Handler(BaseHTTPRequestHandler):
                     _, body = grid(product, key, bbox, int(query.get("width", ["1024"])[0]))
                 finally:
                     grid_semaphore.release()
-                self.send_response(200); self.send_header("Content-Type", "application/vnd.sideral.raster+octet-stream"); self.send_header("Cache-Control", "public, max-age=86400, immutable"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+                self.send_response(200); self.send_header("Content-Type", "application/vnd.sideral.raster+octet-stream"); self.send_header("Access-Control-Allow-Origin", os.getenv("CORS_ORIGIN", "*")); self.send_header("Cache-Control", "public, max-age=86400, immutable"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
             if path in ("/api/goes19/file", "/api/satellite/original"):
-                file = local_file(unquote(query.get("key", [""])[0])); self.send_response(200); self.send_header("Content-Type", "application/x-netcdf"); self.send_header("Content-Disposition", f'attachment; filename="{file.name}"'); self.send_header("Content-Length", str(file.stat().st_size)); self.end_headers(); self.wfile.write(file.read_bytes()); return
+                file = local_file(unquote(query.get("key", [""])[0])); self.send_response(200); self.send_header("Content-Type", "application/x-netcdf"); self.send_header("Access-Control-Allow-Origin", os.getenv("CORS_ORIGIN", "*")); self.send_header("Content-Disposition", f'attachment; filename="{file.name}"'); self.send_header("Content-Length", str(file.stat().st_size)); self.end_headers(); self.wfile.write(file.read_bytes()); return
             if path == "/api/satellite/value":
                 raise NotImplementedError("Use a grade para inspeção; endpoint de valor será ativado após validação do primeiro deployment.")
             self.json(404, {"error": "Endpoint não encontrado"})
