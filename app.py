@@ -1,4 +1,4 @@
-"""Servidor independente do Sideral Satellite (GOES-19 ABI).
+""Servidor independente do Sideral Satellite (GOES-19 ABI).
 
 Este serviço não importa nem depende do server.py principal. Ele pode ser
 implantado separadamente no Back4app/Render e expõe somente a API do satélite.
@@ -44,6 +44,7 @@ catalog_cache: dict[tuple[str, int], tuple[float, dict]] = {}
 catalog_lock = threading.Lock()
 download_lock = threading.Lock()
 processing_locks: dict[str, threading.Lock] = {}
+grid_semaphore = threading.BoundedSemaphore(1)
 
 
 def product_name(value: str) -> str:
@@ -165,7 +166,8 @@ def grid(product: str, key: str, bbox: list[float], width: int) -> tuple[dict, b
     if not allowed_key(key, cfg["channel"]):
         raise ValueError("Arquivo não corresponde ao produto")
     west, south, east, north = bbox
-    width = max(256, min(2048, int(width)))
+    # Evita que várias ampliações simultâneas esgotem a memória do serviço.
+    width = max(256, min(1536, int(width)))
     height = max(256, min(2048, int(round(width * (north - south) / max(.01, (east - west) * math.cos(math.radians((south + north) / 2)))))))
     digest = hashlib.sha1(f"{key}|{product_name(product)}|{bbox}|{width}x{height}".encode()).hexdigest()
     cache_path = CACHE_DIR / f"grid-{digest}.bin"
@@ -192,6 +194,11 @@ def grid(product: str, key: str, bbox: list[float], width: int) -> tuple[dict, b
     metadata = {"format": "sideral-grid-u16-v1", "width": width, "height": height, "bbox": bbox, "scale": cfg["scale"], "offset": cfg["offset"], "nodata": 65535, "units": cfg["units"], "channel": cfg["channel"], "nativeResolutionKm": cfg["native_km"], "projection": "EPSG:3857", "bboxCRS": "EPSG:4326", "resampling": "nearest", "observedAt": key_time(key).isoformat().replace("+00:00", "Z")}
     header = json.dumps(metadata, separators=(",", ":")).encode(); body = struct.pack("<I", len(header)) + header + encoded.tobytes(order="C")
     CACHE_DIR.mkdir(parents=True, exist_ok=True); cache_path.write_bytes(body)
+    # Mantém somente as grades mais recentes; os NetCDF continuam com a poda
+    # própria em local_file().
+    cached_grids = sorted(CACHE_DIR.glob("grid-*.bin"), key=lambda item: item.stat().st_mtime, reverse=True)
+    for old_grid in cached_grids[6:]:
+        old_grid.unlink(missing_ok=True)
     return metadata, body
 
 
@@ -219,7 +226,16 @@ class Handler(BaseHTTPRequestHandler):
                 frame = frames[-1]; stamp = dt.datetime.fromisoformat(frame["timestamp"].replace("Z", "+00:00")); age = max(0, int((dt.datetime.now(dt.timezone.utc) - stamp).total_seconds() / 60)); product = product_name(query.get("product", ["C13"])[0])
                 self.json(200, {"satellite": "GOES-19", "product": product.upper(), "timestamp": frame["timestamp"], "age_minutes": age, "key": frame["key"], "image_url": f"/api/satellite/image?product={product}&key={frame['key']}", "status": "ok"}); return
             if path in ("/api/satellite/image", "/api/goes19/grid", "/api/satellite/raw-grid"):
-                product = product_name(query.get("product", ["C13"])[0]); key = unquote(query.get("key", [""])[0]); bbox = [float(v) for v in query.get("bbox", ["-90,-60,-30,15"])[0].split(",")]; _, body = grid(product, key, bbox, int(query.get("width", ["1024"])[0])); self.send_response(200); self.send_header("Content-Type", "application/vnd.sideral.raster+octet-stream"); self.send_header("Cache-Control", "public, max-age=86400, immutable"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
+                product = product_name(query.get("product", ["C13"])[0]); key = unquote(query.get("key", [""])[0]); bbox = [float(v) for v in query.get("bbox", ["-90,-60,-30,15"])[0].split(",")]
+                # Apenas um processamento pesado por vez. Requests adicionais
+                # aguardam brevemente em vez de abrirem várias grades na RAM.
+                if not grid_semaphore.acquire(timeout=35):
+                    self.json(429, {"status": "busy", "error": "O processamento do satélite está ocupado; tente novamente em alguns segundos."}); return
+                try:
+                    _, body = grid(product, key, bbox, int(query.get("width", ["1024"])[0]))
+                finally:
+                    grid_semaphore.release()
+                self.send_response(200); self.send_header("Content-Type", "application/vnd.sideral.raster+octet-stream"); self.send_header("Cache-Control", "public, max-age=86400, immutable"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); return
             if path in ("/api/goes19/file", "/api/satellite/original"):
                 file = local_file(unquote(query.get("key", [""])[0])); self.send_response(200); self.send_header("Content-Type", "application/x-netcdf"); self.send_header("Content-Disposition", f'attachment; filename="{file.name}"'); self.send_header("Content-Length", str(file.stat().st_size)); self.end_headers(); self.wfile.write(file.read_bytes()); return
             if path == "/api/satellite/value":
