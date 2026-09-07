@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import datetime as dt
@@ -174,6 +173,23 @@ def grid(product: str, key: str, bbox: list[float], width: int) -> tuple[dict, b
         projection = ds.variables["goes_imager_projection"]
         x_axis = np.asarray(ds.variables["x"][:], dtype=np.float64); y_axis = np.asarray(ds.variables["y"][:], dtype=np.float64)
         variable = ds.variables["CMI"]
+        # Lê apenas o recorte da órbita que cobre o bbox pedido. Isso evita
+        # acessos aleatórios ao Full Disk durante cada linha da grade.
+        edge_lon = np.concatenate((np.linspace(west, east, 181), np.full(181, west), np.full(181, east), np.linspace(west, east, 181)))
+        edge_lat = np.concatenate((np.full(181, south), np.linspace(south, north, 181), np.linspace(south, north, 181), np.full(181, north)))
+        edge_x, edge_y = project(edge_lon, edge_lat, projection)
+        valid_edge = np.isfinite(edge_x) & np.isfinite(edge_y)
+        if not valid_edge.any():
+            raise ValueError("Região fora da área visível do GOES-19")
+        ix_edge = np.rint((edge_x[valid_edge] - x_axis[0]) / (x_axis[-1] - x_axis[0]) * (len(x_axis) - 1)).astype(int)
+        iy_edge = np.rint((edge_y[valid_edge] - y_axis[0]) / (y_axis[-1] - y_axis[0]) * (len(y_axis) - 1)).astype(int)
+        pad = 4
+        x0, x1 = max(0, int(ix_edge.min()) - pad), min(len(x_axis), int(ix_edge.max()) + pad + 1)
+        y0, y1 = max(0, int(iy_edge.min()) - pad), min(len(y_axis), int(iy_edge.max()) + pad + 1)
+        source_stride = max(1, int(math.ceil(max((x1 - x0) / width, (y1 - y0) / height))))
+        if hasattr(variable, "set_auto_maskandscale"):
+            variable.set_auto_maskandscale(False)
+        crop = np.ma.filled(variable[y0:y1:source_stride, x0:x1:source_stride], 65535).astype(np.float32, copy=False)
         encoded = np.full((height, width), 65535, dtype="<u2")
         lons = west + (np.arange(width) + .5) * (east - west) / width
         m_n = math.asinh(math.tan(math.radians(north))); m_s = math.asinh(math.tan(math.radians(south)))
@@ -184,9 +200,12 @@ def grid(product: str, key: str, bbox: list[float], width: int) -> tuple[dict, b
             ix = np.rint(np.nan_to_num((px - x_axis[0]) / (x_axis[-1] - x_axis[0]) * (len(x_axis) - 1), nan=-1)).astype(np.int32)
             iy = np.rint(np.nan_to_num((py - y_axis[0]) / (y_axis[-1] - y_axis[0]) * (len(y_axis) - 1), nan=-1)).astype(np.int32)
             valid = np.isfinite(px) & np.isfinite(py) & (ix >= 0) & (ix < len(x_axis)) & (iy >= 0) & (iy < len(y_axis))
+            crop_x = (ix - x0) // source_stride; crop_y = (iy - y0) // source_stride
+            valid &= (crop_x >= 0) & (crop_x < crop.shape[1]) & (crop_y >= 0) & (crop_y < crop.shape[0])
             if valid.any():
-                values = np.full(width, np.nan, dtype=np.float32); values[valid] = np.ma.filled(variable[iy[valid], ix[valid]], np.nan)
-                finite = np.isfinite(values); encoded[row, finite] = np.clip(np.rint((values[finite] * cfg["scale"] + cfg["offset"]) / cfg["scale"]), 0, 65534).astype("<u2")
+                values = np.full(width, 65535, dtype=np.float32); values[valid] = crop[crop_y[valid], crop_x[valid]]
+                finite = np.isfinite(values) & (values != 65535)
+                encoded[row, finite] = np.clip(np.rint(values[finite]), 0, 65534).astype("<u2")
     metadata = {"format": "sideral-grid-u16-v1", "width": width, "height": height, "bbox": bbox, "scale": cfg["scale"], "offset": cfg["offset"], "nodata": 65535, "units": cfg["units"], "channel": cfg["channel"], "nativeResolutionKm": cfg["native_km"], "projection": "EPSG:3857", "bboxCRS": "EPSG:4326", "resampling": "nearest", "observedAt": key_time(key).isoformat().replace("+00:00", "Z")}
     header = json.dumps(metadata, separators=(",", ":")).encode(); body = struct.pack("<I", len(header)) + header + encoded.tobytes(order="C")
     CACHE_DIR.mkdir(parents=True, exist_ok=True); cache_path.write_bytes(body)
