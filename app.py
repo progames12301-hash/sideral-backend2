@@ -1,8 +1,4 @@
-""Servidor independente do Sideral Satellite (GOES-19 ABI).
 
-Este serviço não importa nem depende do server.py principal. Ele pode ser
-implantado separadamente no Back4app/Render e expõe somente a API do satélite.
-"""
 from __future__ import annotations
 
 import datetime as dt
